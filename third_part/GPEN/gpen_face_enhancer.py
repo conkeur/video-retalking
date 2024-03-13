@@ -58,7 +58,7 @@ class FaceEnhancement(object):
         height, width = img.shape[:2]
         full_mask = np.zeros((height, width), dtype=np.float32)
         full_img = np.zeros(ori_img.shape, dtype=np.uint8)
-
+        # mask_sharp = full_mask.copy()#added to prevent error
         for i, (faceb, facial5points) in enumerate(zip(facebs, landms)):
             if faceb[4]<self.threshold: continue
             fh, fw = (faceb[3]-faceb[1]), (faceb[2]-faceb[0])
@@ -119,17 +119,145 @@ class FaceEnhancement(object):
             img = cv2.convertScaleAbs(img_sr*(1-full_mask) + full_img*full_mask)
         
         elif possion_blending is True:
+            longer_side=max(height,width)
+            for i in [512,1024,2048,4096]:
+                if i>=longer_side:
+                    pyrinputsize=i
+                    break
+            if longer_side>4096:
+                pyrinputsize=4096
+            pyrinputsize=512
+            # print('pyrinputsize:',pyrinputsize)
             if bbox is not None:
                 y1, y2, x1, x2 = bbox
                 mask_bbox = np.zeros_like(mask_sharp)
                 mask_bbox[y1:y2 - 5, x1:x2] = 1
-                full_img, ori_img, full_mask = [cv2.resize(x,(512,512)) for x in (full_img, ori_img, np.float32(mask_sharp * mask_bbox))]
+                full_img, ori_img, full_mask = [cv2.resize(x,(pyrinputsize,pyrinputsize)) for x in (full_img, ori_img, np.float32(mask_sharp * mask_bbox))]#changed resize to pyrinputsize*pyrinputsize
             else:
-                full_img, ori_img, full_mask = [cv2.resize(x,(512,512)) for x in (full_img, ori_img, full_mask)]
+                full_img, ori_img, full_mask = [cv2.resize(x,(pyrinputsize,pyrinputsize)) for x in (full_img, ori_img, full_mask)]#changed resize to pyrinputsize*pyrinputsize
             
             img = Laplacian_Pyramid_Blending_with_mask(full_img, ori_img, full_mask, 6)
             img = np.clip(img, 0 ,255)
             img = np.uint8(cv2.resize(img, (width, height)))
+
+        else:
+            img = cv2.convertScaleAbs(ori_img*(1-full_mask) + full_img*full_mask)
+            img = cv2.convertScaleAbs(ori_img*(1-mask_sharp) + img*mask_sharp)
+
+        return img, orig_faces, enhanced_faces
+    
+    def customprocess(self, img, ori_img, bbox, face_enhance=True, possion_blending=False):
+        if self.use_sr:
+            img_sr = self.srmodel.process(img)
+            if img_sr is not None:
+                img = cv2.resize(img, img_sr.shape[:2][::-1])
+
+        facebs, landms = self.facedetector.detect(img.copy())
+
+        orig_faces, enhanced_faces = [], []
+        height, width = img.shape[:2]
+        full_mask = np.zeros((height, width), dtype=np.float32)
+        full_img = np.zeros(ori_img.shape, dtype=np.uint8)
+        # mask_sharp = full_mask.copy()#added to prevent error
+        for i, (faceb, facial5points) in enumerate(zip(facebs, landms)):
+            if faceb[4]<self.threshold: continue
+            fh, fw = (faceb[3]-faceb[1]), (faceb[2]-faceb[0])
+
+            facial5points = np.reshape(facial5points, (2, 5))
+
+            of, tfm_inv = warp_and_crop_face(img, facial5points, reference_pts=self.reference_5pts, crop_size=(self.size, self.size))
+
+            # enhance the face
+            if face_enhance:
+                ef = self.facegan.process(of)
+            else:
+                ef = of
+                    
+            orig_faces.append(of)
+            enhanced_faces.append(ef)
+            
+            # print(ef.shape)
+            # tmp_mask = self.mask
+            '''
+            0: 'background' 1: 'skin'   2: 'nose'
+            3: 'eye_g'  4: 'l_eye'  5: 'r_eye'
+            6: 'l_brow' 7: 'r_brow' 8: 'l_ear'
+            9: 'r_ear'  10: 'mouth' 11: 'u_lip'
+            12: 'l_lip' 13: 'hair'  14: 'hat'
+            15: 'ear_r' 16: 'neck_l'    17: 'neck'
+            18: 'cloth'
+            '''
+
+            # no ear, no neck, no hair&hat,  only face region
+            mm = [0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 0]
+            mask_sharp = self.faceparser.process(ef, mm)[0]/255.
+            tmp_mask = self.mask_postprocess(mask_sharp)
+            tmp_mask = cv2.resize(tmp_mask, ef.shape[:2])
+            mask_sharp = cv2.resize(mask_sharp, ef.shape[:2])
+
+            tmp_mask = cv2.warpAffine(tmp_mask, tfm_inv, (width, height), flags=3)
+            mask_sharp = cv2.warpAffine(mask_sharp, tfm_inv, (width, height), flags=3)
+
+            if min(fh, fw)<100: # gaussian filter for small faces
+                ef = cv2.filter2D(ef, -1, self.kernel)
+            
+            if face_enhance:
+                tmp_img = cv2.warpAffine(ef, tfm_inv, (width, height), flags=3)
+            else:
+                tmp_img = cv2.warpAffine(of, tfm_inv, (width, height), flags=3)
+
+            mask = tmp_mask - full_mask
+            full_mask[np.where(mask>0)] = tmp_mask[np.where(mask>0)]
+            full_img[np.where(mask>0)] = tmp_img[np.where(mask>0)]
+
+        mask_sharp = cv2.GaussianBlur(mask_sharp, (0,0), sigmaX=1, sigmaY=1, borderType = cv2.BORDER_DEFAULT)
+
+        full_mask = full_mask[:, :, np.newaxis]
+        mask_sharp = mask_sharp[:, :, np.newaxis]
+
+        if self.use_sr and img_sr is not None:
+            img = cv2.convertScaleAbs(img_sr*(1-full_mask) + full_img*full_mask)
+        
+        elif possion_blending is True:
+            y1, y2, x1, x2 = bbox
+            mask_bbox = np.zeros_like(mask_sharp)
+            mask_bbox[y1:y2 - 5, x1:x2] = 1
+            cropheight=y2-y1
+            cropwidth=x2-x1
+            for i in [512,1024,2048,4096]:
+                if cropheight<i:
+                    y1-=int((i-cropheight)/2)
+                    y2+=int((i-cropheight)/2)
+                    break
+            for i in [512,1024,2048,4096]:
+                if cropwidth<i:
+                    x1-=int((i-cropwidth)/2)
+                    x2+=int((i-cropwidth)/2)
+                    break
+            ori_img_crop=(ori_img[y1:y2, x1:x2])
+            full_img_crop=full_img[y1:y2, x1:x2]
+            mask_sharp_crop=mask_sharp [y1:y2, x1:x2]
+            mask_bbox_crop= mask_bbox[y1:y2, x1:x2]    
+            height, width = full_img_crop.shape[:2]
+            longer_side=max(height,width)
+            for i in [512,1024,2048,4096]:
+                if i>=longer_side:
+                    pyrinputsize=i
+                    break
+            if longer_side>4096:
+                pyrinputsize=4096
+            # print('pyrinputsize:',pyrinputsize)
+  
+            
+            
+            # full_img, ori_img, full_mask = [cv2.resize(x,(pyrinputsize,pyrinputsize)) for x in (full_img, ori_img, np.float32(mask_sharp * mask_bbox))]
+            full_img_crop, ori_img_crop, mask_sharp_crop = [cv2.resize(x,(pyrinputsize,pyrinputsize)) for x in (full_img_crop, ori_img_crop, np.float32(mask_sharp_crop * mask_bbox_crop))] 
+            
+            img = Laplacian_Pyramid_Blending_with_mask(full_img_crop, ori_img_crop, mask_sharp_crop , 6)
+            img = np.clip(img, 0 ,255)
+            img = np.uint8(cv2.resize(img, (width, height)))
+            ori_img[y1:y2, x1:x2]=img
+            img=ori_img
 
         else:
             img = cv2.convertScaleAbs(ori_img*(1-full_mask) + full_img*full_mask)
