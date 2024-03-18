@@ -224,15 +224,18 @@ class FaceEnhancement(object):
             mask_bbox[y1:y2 - 5, x1:x2] = 1
             cropheight=y2-y1
             cropwidth=x2-x1
+            larger_side=max(cropheight,cropwidth)
+            orig_height,orig_width=ori_img.shape[:2]
             for i in [512,1024,2048,4096]:
-                if cropheight<i:
+                if larger_side<i:
                     y1-=int((i-cropheight)/2)
                     y2+=int((i-cropheight)/2)
-                    break
-            for i in [512,1024,2048,4096]:
-                if cropwidth<i:
                     x1-=int((i-cropwidth)/2)
                     x2+=int((i-cropwidth)/2)
+                    y1=max(y1,0)
+                    y2=min(y2,orig_height)
+                    x1=max(x1,0)
+                    x2=min(x2,orig_width)
                     break
             ori_img_crop=(ori_img[y1:y2, x1:x2])
             full_img_crop=full_img[y1:y2, x1:x2]
